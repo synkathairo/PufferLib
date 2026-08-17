@@ -34,6 +34,13 @@ _TORCH_TO_TYPESTR = {
     torch.float32: '<f4',
 }
 
+def _torch_device():
+    if _C.gpu:
+        return torch.device('cuda')
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return torch.device('mps')
+    return torch.device('cpu')
+
 def _log_prob(logits, value):
     value = value.long().unsqueeze(-1)
     value, log_pmf = torch.broadcast_tensors(value, logits)
@@ -116,12 +123,13 @@ def _cpu_tensor(ptr, shape, dtype):
 class PuffeRL:
     def __init__(self, args, vec, policy, verbose=True):
         config = args['train']
-        device = 'cuda' if _C.gpu else 'cpu'
+        device = _torch_device()
         self.device = device
 
         torch.set_float32_matmul_precision('high')
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = True
+        if device.type == 'cuda':
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = True
 
         self._vec = vec
         self.gpu = vec.gpu
@@ -238,6 +246,7 @@ class PuffeRL:
                 self._vec.gpu_step(actions_flat.data_ptr())
                 torch.cuda.synchronize()
             else:
+                actions_flat = actions_flat.cpu()
                 self._vec.cpu_step(actions_flat.data_ptr())
 
             o, r, d = self.vec_obs, self.vec_rewards, self.vec_terminals
@@ -408,7 +417,7 @@ class PuffeRL:
     def create_pufferl(cls, args):
         '''Matches _C.create_pufferl(args) interface.'''
         # DDP setup
-        if 'LOCAL_RANK' in os.environ:
+        if 'LOCAL_RANK' in os.environ and _C.gpu:
             world_size = int(os.environ.get('WORLD_SIZE', 1))
             local_rank = int(os.environ['LOCAL_RANK'])
             torch.cuda.set_device(local_rank)
@@ -418,7 +427,7 @@ class PuffeRL:
         vec = _C.create_vec(args, _C.gpu)
         policy = load_policy(args, vec)
 
-        if 'LOCAL_RANK' in os.environ:
+        if 'LOCAL_RANK' in os.environ and _C.gpu:
             torch.distributed.init_process_group(backend='nccl', world_size=world_size)
             policy = policy.to(local_rank)
             model = torch.nn.parallel.DistributedDataParallel(
@@ -434,6 +443,17 @@ class PuffeRL:
 def compute_puff_advantage(values, rewards, terminals,
         ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip):
     num_steps, horizon = values.shape
+    if values.device.type == 'mps':
+        cpu_args = [tensor.detach().cpu() for tensor in
+            (values, rewards, terminals, ratio)]
+        cpu_advantages = torch.empty_like(advantages, device='cpu')
+        _C.puff_advantage_cpu(
+            *(tensor.data_ptr() for tensor in (*cpu_args, cpu_advantages)),
+            num_steps, horizon,
+            gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip)
+        advantages.copy_(cpu_advantages)
+        return advantages
+
     fn = _C.puff_advantage if values.is_cuda else _C.puff_advantage_cpu
     fn(
         values.data_ptr(), rewards.data_ptr(), terminals.data_ptr(),
@@ -484,7 +504,7 @@ def load_policy(args, vec):
     decoder = decoder_cls(vec.act_sizes, policy_kwargs['hidden_size'])
     policy = pufferlib.models.Policy(encoder, decoder, network)
 
-    device = 'cuda' if _C.gpu else 'cpu'
+    device = _torch_device()
     policy = policy.to(device)
 
     load_id = args['load_id']
@@ -513,4 +533,3 @@ def load_policy(args, vec):
         policy.load_state_dict(state_dict)
 
     return policy
-

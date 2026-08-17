@@ -55,12 +55,18 @@ PLATFORM="$(uname -s)"
 if [ "$PLATFORM" = "Linux" ]; then
     RAYLIB_NAME='raylib-5.5_linux_amd64'
     OMP_LIB=-lomp5
+    OMP_CFLAGS=(-fopenmp)
+    OMP_LDFLAGS=(-lomp5)
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-lGL)
     SHARED_LDFLAGS=(-Bsymbolic-functions)
 else
     RAYLIB_NAME='raylib-5.5_macos'
     OMP_LIB=-lomp
+    TORCH_INCLUDE_DIR=$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'include'))")
+    TORCH_LIB_DIR=$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+    OMP_CFLAGS=(-Xpreprocessor -fopenmp -I"$TORCH_INCLUDE_DIR")
+    OMP_LDFLAGS=(-L"$TORCH_LIB_DIR" -Wl,-rpath,"$TORCH_LIB_DIR" -lomp)
     SANITIZE_FLAGS=()
     STANDALONE_LDFLAGS=(-framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL)
     SHARED_LDFLAGS=(-framework Cocoa -framework OpenGL -framework IOKit -undefined dynamic_lookup)
@@ -145,7 +151,11 @@ OUTPUT_NAME=${OUTPUT_NAME:-$ENV}
 # Standalone environment build
 # -mavx2 enables AVX2 intrinsics (__m256, _mm256_*) which drive.h and
 # src/bf16.h use directly. x86_64 only — strip if porting to ARM/Apple Silicon.
-SIMD_FLAGS=(-mavx2 -mfma)
+if [ "$(uname -m)" = "x86_64" ]; then
+    SIMD_FLAGS=(-mavx2 -mfma)
+else
+    SIMD_FLAGS=()
+fi
 if [ -n "$DEBUG" ] || [ "$MODE" = "local" ]; then
     CLANG_OPT=(-g -O0 "${CLANG_WARN[@]}" "${SANITIZE_FLAGS[@]}" "${SIMD_FLAGS[@]}")
     NVCC_OPT="-O0 -g"
@@ -162,7 +172,7 @@ if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
         "${LINK_ARCHIVES[@]}"
         "${EXTRA_LDFLAGS[@]}"
         "${STANDALONE_LDFLAGS[@]}"
-        -lm -lpthread -fopenmp
+        -lm -lpthread "${OMP_LDFLAGS[@]}"
         -DPLATFORM_DESKTOP
     )
     echo "Compiling $ENV..."
@@ -267,7 +277,7 @@ ${CC:-clang} -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS \
     -I./$RAYLIB_NAME/include -I$CUDA_HOME/include \
     -DPLATFORM_DESKTOP \
     -fno-semantic-interposition -fvisibility=hidden \
-    -fPIC -fopenmp \
+    -fPIC "${OMP_CFLAGS[@]}" \
     "$BINDING_SRC" -o "$STATIC_OBJ"
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
 
@@ -310,7 +320,7 @@ if [ -z "$MODE" ]; then
 
 elif [ "$MODE" = "cpu" ]; then
     echo "Compiling CPU training backend..."
-    ${CXX:-g++} -c -fPIC -fopenmp \
+    ${CXX:-g++} -c -fPIC "${OMP_CFLAGS[@]}" \
         -D_GLIBCXX_USE_CXX11_ABI=1 \
         -DPLATFORM_DESKTOP \
         -std=c++17 \
@@ -321,10 +331,10 @@ elif [ "$MODE" = "cpu" ]; then
         $PRECISION $LINK_OPT \
         src/bindings_cpu.cpp -o build/bindings_cpu.o
     LINK_CMD=(
-        ${CXX:-g++} -shared -fPIC -fopenmp
+        ${CXX:-g++} -shared -fPIC
         build/bindings_cpu.o "$STATIC_LIB" "$RAYLIB_A"
         "${EXTRA_LDFLAGS[@]}"
-        -lm -lpthread $OMP_LIB $LINK_OPT
+        -lm -lpthread "${OMP_LDFLAGS[@]}" $LINK_OPT
         "${SHARED_LDFLAGS[@]}"
         -o "$OUTPUT"
     )
